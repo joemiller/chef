@@ -25,191 +25,127 @@ class Chef
   class Provider
     class Service
       class Openbsd < Chef::Provider::Service::Init
-
-        provides :service, os: [ "openbsd" ]
+        provides :service, os: 'openbsd'
 
         include Chef::Mixin::ShellOut
 
-        attr_reader :init_command, :rc_conf, :rc_conf_local, :enabled_state_found
-
-        RC_CONF_PATH = '/etc/rc.conf'
-        RC_CONF_LOCAL_PATH = '/etc/rc.conf.local'
-
         def initialize(new_resource, run_context)
           super
-          @rc_conf = ::File.read(RC_CONF_PATH) rescue ''
-          @rc_conf_local = ::File.read(RC_CONF_LOCAL_PATH) rescue ''
-          @init_command = ::File.exist?(rcd_script_path) ? rcd_script_path : nil
           new_resource.supports[:status] = true
-          new_resource.status_command("#{default_init_command} check")
+          new_resource.status_command("rcctl check #{new_resource.service_name}")
+          new_resource.start_command("rcctl start #{new_resource.service_name}")
+          new_resource.stop_command("rcctl stop #{new_resource.service_name}")
+          new_resource.restart_command("rcctl restart #{new_resource.service_name}")
+          new_resource.reload_command("rcctl reload #{new_resource.service_name}")
         end
 
         def load_current_resource
           @current_resource = Chef::Resource::Service.new(new_resource.name)
           current_resource.service_name(new_resource.service_name)
 
-          Chef::Log.debug("#{current_resource} found at #{init_command}")
-
           determine_current_status!
-          determine_enabled_status!
-          current_resource
+          determine_current_parameters!
+
+          current_resource.enabled is_enabled?
         end
 
         def define_resource_requirements
           shared_resource_requirements
 
-          requirements.assert(:start, :enable, :reload, :restart) do |a|
-            a.assertion { init_command }
-            a.failure_message Chef::Exceptions::Service, "#{new_resource}: unable to locate the rc.d script"
+          requirements.assert(:start, :enable, :reload, :restart, :status) do |a|
+            a.assertion { service_exists? }
+            a.failure_message Chef::Exceptions::Service, "#{new_resource}: rcctl does not recognize this service."
           end
+        end
 
-          requirements.assert(:all_actions) do |a|
-            a.assertion { enabled_state_found }
-            # for consistency with original behavior, this will not fail in non-whyrun mode;
-            # rather it will silently set enabled state=>false
-            a.whyrun "Unable to determine enabled/disabled state, assuming this will be correct for an actual run.  Assuming disabled."
+        # Enable service and optionally set any additional variables such as command line flags
+        # that are stored in the `parameters` hash.
+        #
+        # As of OpenBSD 5.7 the following variables can be set (rcctl(8)):
+        #
+        #   flags, timeout, user.
+        #
+        # This code does not strictly enforce these variables since rcctl(8) will
+        # exit non-zero if you give it something it does not recognize.
+        #
+        def action_enable
+          if current_resource.enabled && !parameters_need_update?
+            Chef::Log.debug("#{new_resource} already enabled - nothing to do")
+          else
+            converge_by("enable service #{new_resource}") do
+              update_params!
+              enable_service
+              Chef::Log.info("#{new_resource} enabled")
+            end
           end
-
-          requirements.assert(:start, :enable, :reload, :restart) do |a|
-            a.assertion { init_command && builtin_service_enable_variable_name != nil }
-            a.failure_message Chef::Exceptions::Service, "Could not find the service name in #{init_command} and rcvar"
-            # No recovery in whyrun mode - the init file is present but not correct.
-          end
+          load_new_resource_state
+          new_resource.enabled(true)
         end
 
         def enable_service
-          if !is_enabled?
-            if is_builtin?
-              if is_enabled_by_default?
-                update_rcl rc_conf_local.sub(/^#{Regexp.escape(builtin_service_enable_variable_name)}=.*/, '')
-              else
-                # add line with blank string, which means enable
-                update_rcl rc_conf_local + "\n" + "#{builtin_service_enable_variable_name}=\"\"\n"
-              end
-            else
-              # add to pkg_scripts, most recent addition goes last
-              old_services_list = rc_conf_local.match(/^pkg_scripts="(.*)"/)
-              old_services_list = old_services_list ? old_services_list[1].split(' ') : []
-              new_services_list = old_services_list + [new_resource.service_name]
-              if rc_conf_local.match(/^pkg_scripts="(.*)"/)
-                new_rcl = rc_conf_local.sub(/^pkg_scripts="(.*)"/, "pkg_scripts=\"#{new_services_list.join(' ')}\"")
-              else
-                new_rcl = rc_conf_local + "\n" + "pkg_scripts=\"#{new_services_list.join(' ')}\"\n"
-              end
-              update_rcl new_rcl
-            end
-          end
+          shell_out!("rcctl enable #{new_resource.service_name}")
         end
 
         def disable_service
-          if is_enabled?
-            if is_builtin?
-              if is_enabled_by_default?
-                # add line to disable
-                update_rcl rc_conf_local + "\n" + "#{builtin_service_enable_variable_name}=\"NO\"\n"
-              else
-                # remove line to disable
-                update_rcl rc_conf_local.sub(/^#{Regexp.escape(builtin_service_enable_variable_name)}=.*/, '')
-              end
-            else
-              # remove from pkg_scripts
-              old_list = rc_conf_local.match(/^pkg_scripts="(.*)"/)
-              old_list = old_list ? old_list[1].split(' ') : []
-              new_list = old_list - [new_resource.service_name]
-              update_rcl rc_conf_local.sub(/^pkg_scripts="(.*)"/, pkg_scripts="#{new_list.join(' ')}")
-            end
-          end
+          shell_out!("rcctl disable #{new_resource.service_name}")
         end
 
         private
 
-        def rcd_script_found?
-          !init_command.nil?
+        # `rcctl get <service> status` returns:
+        # - 0: service is enabled
+        # - 1: service is not enabled
+        # - 2: service does not exist
+        def rcctl_status
+          shell_out!("rcctl get #{new_resource.service_name} status", env: nil, returns: [0, 1, 2]).status
         end
 
-        def rcd_script_path
-          "/etc/rc.d/#{new_resource.service_name}"
+        def service_exists?
+          rcctl_status != 2
         end
 
-        def update_rcl(value)
-          FileUtils.touch RC_CONF_LOCAL_PATH if !::File.exists? RC_CONF_LOCAL_PATH
-          ::File.write(RC_CONF_LOCAL_PATH, value)
-          @rc_conf_local = value
+        def is_enabled?
+          rcctl_status == 0
         end
 
-        # The variable name used in /etc/rc.conf.local for enabling this service
-        def builtin_service_enable_variable_name
-          @bsevn ||= begin
-            result = nil
-            if rcd_script_found?
-              ::File.open(init_command) do |rcscript|
-                if m = rcscript.read.match(/^# \$OpenBSD: (\w+)[(.rc),]?/)
-                  result = m[1] + "_flags"
-                end
-              end
-            end
-            # Fallback allows us to keep running in whyrun mode when
-            # the script does not exist.
-            result || new_resource.service_name
-          end
+        def rcctl_enable
+          shell_out!("rcctl enable #{new_resource.service_name}")
         end
 
-        def is_builtin?
-          result = false
-          var_name = builtin_service_enable_variable_name
-          if var_name
-            if rc_conf.match(/^#{Regexp.escape(var_name)}=(.*)/)
-              result = true
+        # ex:
+        #   $ rcctl get sshd
+        #   sshd_flags=foo
+        #   sshd_timeout=30
+        #   sshd_user=root
+        def determine_current_parameters!
+          current_resource.parameters Hash.new
+          shell_out!("rcctl get #{new_resource.service_name}", returns: [0, 1]).stdout.each_line do |line|
+            if line =~ /^#{Regexp.escape(new_resource.service_name)}_(.+?)=(.*)/
+              current_resource.parameters[Regexp.last_match(1)] = Regexp.last_match(2)
+            else
+              Chef::Log.warn("Problem parsing '#{line}' from 'rcctl get #{new_resource.service_name}'")
+              next
             end
           end
-          result
+          Chef::Log.debug("current params from #{new_resource}: #{current_resource.parameters}")
         end
 
-        def is_enabled_by_default?
-          result = false
-          var_name = builtin_service_enable_variable_name
-          if var_name
-            if m = rc_conf.match(/^#{Regexp.escape(var_name)}=(.*)/)
-              if !(m[1] =~ /"?[Nn][Oo]"?/)
-                result = true
-              end
+        # check the current parameters against any newly specified parameters.
+        def parameters_need_update?
+          if new_resource.parameters && current_resource.parameters
+            new_resource.parameters.each do |k, v|
+              return true if current_resource.parameters[k.to_s] != v.to_s
             end
           end
-          result
+          false
         end
 
-        def determine_enabled_status!
-          result = false # Default to disabled if the service doesn't currently exist at all
-          @enabled_state_found = false
-          if is_builtin?
-            var_name = builtin_service_enable_variable_name
-            if var_name
-              if m = rc_conf_local.match(/^#{Regexp.escape(var_name)}=(.*)/)
-                @enabled_state_found = true
-                if !(m[1] =~ /"?[Nn][Oo]"?/) # e.g. looking for httpd_flags=NO
-                  result = true
-                end
-              end
-            end
-            if !@enabled_state_found
-              result = is_enabled_by_default?
-            end
-          else
-            var_name = @new_resource.service_name
-            if var_name
-              if m = rc_conf_local.match(/^pkg_scripts="(.*)"/)
-                @enabled_state_found = true
-                if m[1].include?(var_name) # e.g. looking for 'gdm' in pkg_scripts="gdm unbound"
-                  result = true
-                end
-              end
-            end
+        def update_params!
+          new_resource.parameters.each do |k, v|
+            Chef::Log.debug("Updating #{new_resource} parameter '#{k}' to '#{v}'")
+            shell_out!("rcctl set #{new_resource.service_name} \"#{k}\" \"#{v}\"")
           end
-
-          current_resource.enabled result
         end
-        alias :is_enabled? :determine_enabled_status!
-
       end
     end
   end
